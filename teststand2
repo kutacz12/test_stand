@@ -1,0 +1,444 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <math.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/*
+  Teensy 4.1 + ADS1263 (Waveshare HAT)
+  Plan:
+    - ADC ~2 kSPS
+    - Trend @100 Hz: mean of 20 samples (20/2000s = 10ms)
+    - Vibration metrics from 200-sample window (100ms):
+        RMS(AC) and Peak-to-Peak
+    - Log to built-in SD (SDIO) as CSV
+    - OLED shows: trend Now/Max/Avg + RMS + P-P
+
+  OLED wiring (power from 3.3V):
+    SDA=18, SCL=19, GND common
+*/
+
+// ===== optionally show telemetry =====
+#define SERIAL_TELEMETRY 0
+
+// =================== PINOUT ===================
+#define BUZZER_PIN         9
+#define STOP_BUTTON_PIN    8
+
+#define ADS_CS_PIN         7
+#define ADS_DRDY_PIN       2
+#define ADS_RST_PIN        3
+
+// ===== OLED =====
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+static const uint8_t OLED_ADDR = 0x3C; // try 0x3D if needed
+
+// =================== ADS1263 COMMANDS ===================
+#define ADS_CMD_RESET      0x06
+#define ADS_CMD_START1     0x08
+#define ADS_CMD_STOP1      0x0A
+#define ADS_CMD_RREG       0x20
+#define ADS_CMD_WREG       0x40
+#define ADS_CMD_SDATAC1    0x11
+#define ADS_CMD_RDATAC1    0x10
+
+// =================== ADS1263 REGISTERS ===================
+#define REG_ID          0x00
+#define REG_POWER       0x01
+#define REG_INTERFACE   0x02
+#define REG_MODE0       0x03
+#define REG_MODE1       0x04
+#define REG_MODE2       0x05
+#define REG_INPMUX      0x06
+#define REG_REFMUX      0x0F
+
+// =================== GLOBALS ===================
+static const SPISettings ADS_SPI(2000000, MSBFIRST, SPI_MODE1);
+static volatile bool adsDataReady = false;
+
+File dataFile;
+bool recording = true;
+
+// --- Calibration & tare ---
+float      CALIBRATION_FACTOR = -0.005984566f; // [g/LSB] overridden from calib.txt if present
+long long  tareOffset = 0;
+
+// --- Rates ---
+static const uint16_t ADC_FS_HZ       = 2000; // target ~2 kSPS
+static const uint16_t LOG_RATE_HZ     = 100;  // 100 Hz trend
+static const uint16_t TREND_N         = (ADC_FS_HZ / LOG_RATE_HZ); // 20 samples per 10ms
+static const uint16_t VIB_WINDOW_N    = 200;  // 100 ms @ 2kSPS
+static const uint16_t VIB_LOG_RATE_HZ = 10;   // log vibration metrics @10 Hz (every 100ms)
+
+// flush batching
+static const uint16_t FLUSH_EVERY_LINES = 200;
+
+// --- Trend accumulators ---
+static uint16_t trendCount = 0;
+static long long trendAcc = 0;
+
+// --- Vibration window accumulators (over 200 samples) ---
+static uint16_t vibCount = 0;
+static long long vibAcc = 0;
+static long long vibAccSq = 0;
+static int32_t vibMin = INT32_MAX;
+static int32_t vibMax = INT32_MIN;
+
+// --- Values for display/log ---
+volatile float trend_g = 0.0f;     // 100Hz trend
+volatile float trend_max_g = -1e9f;
+volatile double trend_sum_g = 0.0;
+volatile uint32_t trend_cnt = 0;
+
+volatile float vib_rms_g = 0.0f;   // 10Hz metrics
+volatile float vib_pp_g  = 0.0f;
+
+// =================== LOW-LEVEL ADS I/O ===================
+inline void ads_cs_low()  { digitalWrite(ADS_CS_PIN, LOW); }
+inline void ads_cs_high() { digitalWrite(ADS_CS_PIN, HIGH); }
+inline void ads_spi_begin() { SPI.beginTransaction(ADS_SPI); }
+inline void ads_spi_end()   { SPI.endTransaction(); }
+uint8_t ads_transfer(uint8_t b) { return SPI.transfer(b); }
+
+void ads_writeCommand(uint8_t cmd) {
+  ads_spi_begin(); ads_cs_low();
+  ads_transfer(cmd);
+  ads_cs_high(); ads_spi_end();
+}
+
+void ads_writeRegister(uint8_t addr, uint8_t value) {
+  ads_spi_begin(); ads_cs_low();
+  ads_transfer(ADS_CMD_WREG | (addr & 0x1F));
+  ads_transfer(0x00);
+  ads_transfer(value);
+  ads_cs_high(); ads_spi_end();
+}
+
+uint8_t ads_readRegister(uint8_t addr) {
+  ads_spi_begin(); ads_cs_low();
+  ads_transfer(ADS_CMD_RREG | (addr & 0x1F));
+  ads_transfer(0x00);
+  uint8_t v = ads_transfer(0x00);
+  ads_cs_high(); ads_spi_end();
+  return v;
+}
+
+void drdy_isr() { adsDataReady = true; }
+
+void ads_reset() {
+  digitalWrite(ADS_RST_PIN, LOW); delay(2);
+  digitalWrite(ADS_RST_PIN, HIGH); delay(5);
+  ads_writeCommand(ADS_CMD_RESET); delay(5);
+}
+
+// Continuous read (RDATAC), STATUS disabled → 4 data bytes
+bool ads_readData32_cont_raw(int32_t &value) {
+  if (digitalRead(ADS_DRDY_PIN) == HIGH) return false;
+  ads_spi_begin(); ads_cs_low();
+
+  uint8_t b0 = ads_transfer(0x00);
+  uint8_t b1 = ads_transfer(0x00);
+  uint8_t b2 = ads_transfer(0x00);
+  uint8_t b3 = ads_transfer(0x00);
+
+  ads_cs_high(); ads_spi_end();
+
+  uint32_t raw = ((uint32_t)b0<<24)|((uint32_t)b1<<16)|((uint32_t)b2<<8)|b3;
+  value = (int32_t)raw;
+  return true;
+}
+
+// =================== CONFIG (~2 kSPS, SINC3, PGA=32, REF=AVDD-AVSS) ===================
+void ads_apply_config_2kHz() {
+  ads_writeCommand(ADS_CMD_SDATAC1);
+  ads_writeCommand(ADS_CMD_STOP1);
+
+  ads_writeRegister(REG_INTERFACE, 0b00001010); // STATUS=0, CRC=0, 32-bit=1
+
+  ads_writeRegister(REG_MODE0,     0b00000000); // SINC3
+  ads_writeRegister(REG_MODE1,     0b00110010); // PGA=32, BOOST x2
+
+  // !!! DRATE: may need tweaking depending on ADS1263 mapping on your lib/hardware.
+  // Start with this; if you observe ~1kSPS, change this value (e.g. 0x2B or 0x2C).
+  ads_writeRegister(REG_MODE2,     0x2B);       // try ~2 kSPS
+
+  ads_writeRegister(REG_INPMUX,    (0b00000<<4) | 0b00001); // AIN0/AIN1
+  ads_writeRegister(REG_REFMUX,    0b00000000); // AVDD-AVSS
+
+  ads_writeCommand(ADS_CMD_RDATAC1);
+  ads_writeCommand(ADS_CMD_START1);
+}
+
+void ads_dump_registers() {
+  Serial.println(F("=== ADS reg dump ==="));
+  Serial.print(F("ID=0x"));     Serial.println(ads_readRegister(REG_ID), HEX);
+  Serial.print(F("POWER=0x"));  Serial.println(ads_readRegister(REG_POWER), HEX);
+  Serial.print(F("INTERFACE=0x")); Serial.println(ads_readRegister(REG_INTERFACE), HEX);
+  Serial.print(F("MODE0=0x"));  Serial.println(ads_readRegister(REG_MODE0), HEX);
+  Serial.print(F("MODE1=0x"));  Serial.println(ads_readRegister(REG_MODE1), HEX);
+  Serial.print(F("MODE2=0x"));  Serial.println(ads_readRegister(REG_MODE2), HEX);
+  Serial.print(F("INPMUX=0x")); Serial.println(ads_readRegister(REG_INPMUX), HEX);
+  Serial.print(F("REFMUX=0x")); Serial.println(ads_readRegister(REG_REFMUX), HEX);
+  Serial.println(F("===================="));
+}
+
+// =================== HELPERS ===================
+void startSignal(){ for(int i=0;i<2;i++){digitalWrite(BUZZER_PIN,HIGH);delay(150);digitalWrite(BUZZER_PIN,LOW);delay(150);} }
+void stopSignal(){ digitalWrite(BUZZER_PIN,HIGH);delay(600);digitalWrite(BUZZER_PIN,LOW); }
+void errorSignal(){ for(int i=0;i<3;i++){digitalWrite(BUZZER_PIN,HIGH);delay(250);digitalWrite(BUZZER_PIN,LOW);delay(250);} }
+
+bool loadCalibrationFromSD(){
+  File f = SD.open("calib.txt", FILE_READ);
+  if(!f) return false;
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  if(s.length()==0) return false;
+  float v = s.toFloat();
+  if(v == 0.0f || !isfinite(v)) return false;
+  CALIBRATION_FACTOR = v;
+  return true;
+}
+
+void resetStatsAndAccumulators() {
+  // trend
+  trendCount = 0; trendAcc = 0;
+
+  // vib window
+  vibCount = 0; vibAcc = 0; vibAccSq = 0;
+  vibMin = INT32_MAX; vibMax = INT32_MIN;
+
+  // displayed stats
+  trend_g = 0.0f;
+  trend_max_g = -1e9f;
+  trend_sum_g = 0.0;
+  trend_cnt = 0;
+
+  vib_rms_g = 0.0f;
+  vib_pp_g  = 0.0f;
+}
+
+void doTare(uint16_t N=400){
+  Serial.println(F("Taring..."));
+  delay(20);
+
+  long long acc=0; int32_t raw;
+  for(uint16_t i=0;i<N;i++){
+    while(!ads_readData32_cont_raw(raw)){}
+    acc += (long long)raw;
+  }
+  tareOffset = acc / N;
+
+  resetStatsAndAccumulators();
+
+  Serial.print(F("Tare complete. tareOffset = "));
+  Serial.println((long long)tareOffset);
+}
+
+// =================== OLED ===================
+void oledInit() {
+  Wire.begin();
+  Wire.setClock(400000);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    // try 0x3D if blank
+    return;
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Logger start...");
+  display.display();
+}
+
+void oledUpdate(bool rec, uint32_t ms) {
+  static uint32_t last = 0;
+  if (ms - last < 100) return; // 10 Hz
+  last = ms;
+
+  float g_now = trend_g;
+  float g_max = trend_max_g;
+  float g_avg = (trend_cnt > 0) ? (float)(trend_sum_g / (double)trend_cnt) : 0.0f;
+
+  float r = vib_rms_g;
+  float p = vib_pp_g;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+
+  display.print("REC: "); display.println(rec ? "ON" : "OFF");
+
+  display.print("Now: "); display.print(g_now, 1);
+  display.print("g "); display.print(g_now * 0.00980665f, 2); display.println("N");
+
+  display.print("Max: "); display.print(g_max, 1);
+  display.print("g "); display.print(g_max * 0.00980665f, 2); display.println("N");
+
+  display.print("Avg: "); display.print(g_avg, 1);
+  display.print("g "); display.print(g_avg * 0.00980665f, 2); display.println("N");
+
+  display.print("RMS: "); display.print(r, 1); display.print("g  ");
+  display.print("P-P: "); display.print(p, 1); display.println("g");
+
+  display.display();
+}
+
+// =================== SETUP ===================
+void setup() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(ADS_CS_PIN, OUTPUT);
+  pinMode(ADS_RST_PIN, OUTPUT);
+  pinMode(ADS_DRDY_PIN, INPUT_PULLUP);
+  digitalWrite(ADS_CS_PIN, HIGH);
+
+  Serial.begin(500000); delay(50);
+  Serial.println(F("Starting (Logger)..."));
+
+  SPI.begin();
+  oledInit();
+
+  // ADS init
+  ads_reset();
+  ads_apply_config_2kHz();
+  ads_dump_registers();
+  attachInterrupt(digitalPinToInterrupt(ADS_DRDY_PIN), drdy_isr, FALLING);
+
+  // SD init (Teensy 4.1 built-in)
+  if (!SD.begin(BUILTIN_SDCARD)) {
+    Serial.println(F("SD init failed (BUILTIN_SDCARD)!"));
+    errorSignal();
+    while(1){}
+  }
+
+  dataFile = SD.open("datalog.csv", FILE_WRITE);
+  if (!dataFile) {
+    Serial.println(F("Error opening datalog.csv!"));
+    errorSignal();
+    while(1){}
+  }
+  dataFile.println("Time_ms,Trend_g,VibRMS_g,VibPP_g");
+  dataFile.flush();
+
+  if(loadCalibrationFromSD()){
+    Serial.print(F("Loaded CALIBRATION_FACTOR: "));
+    Serial.println(CALIBRATION_FACTOR, 9);
+  } else {
+    Serial.print(F("Using built-in CALIBRATION_FACTOR: "));
+    Serial.println(CALIBRATION_FACTOR, 9);
+  }
+
+  doTare(400);
+  startSignal();
+  Serial.println(F("Komendy:  t -> tare"));
+}
+
+// =================== LOOP ===================
+void loop() {
+  static uint16_t flushCnt = 0;
+
+  // Drain samples whenever DRDY interrupt has fired
+  if (adsDataReady) {
+    adsDataReady = false;
+
+    while (digitalRead(ADS_DRDY_PIN) == LOW) {
+      int32_t raw;
+      if (!ads_readData32_cont_raw(raw)) break;
+
+      int32_t net = (int32_t)((long long)raw - tareOffset);
+
+      // ---- Trend block (20 samples => 100 Hz) ----
+      trendAcc += (long long)net;
+      trendCount++;
+
+      if (trendCount >= TREND_N) {
+        long long meanLSB = trendAcc / (long long)TREND_N;
+        trendAcc = 0;
+        trendCount = 0;
+
+        float g = (float)meanLSB * CALIBRATION_FACTOR;
+        trend_g = g;
+        if (g > trend_max_g) trend_max_g = g;
+        trend_sum_g += (double)g;
+        trend_cnt++;
+
+        uint32_t now = millis();
+
+        // Write trend always @100 Hz, but vibration metrics update @10 Hz (last computed)
+        if (recording && dataFile) {
+          dataFile.print(now);
+          dataFile.print(",");
+          dataFile.print(g, 3);
+          dataFile.print(",");
+          dataFile.print(vib_rms_g, 3);
+          dataFile.print(",");
+          dataFile.println(vib_pp_g, 3);
+
+          if (++flushCnt >= FLUSH_EVERY_LINES) { dataFile.flush(); flushCnt = 0; }
+        }
+
+        #if SERIAL_TELEMETRY
+          Serial.print("t="); Serial.print(now);
+          Serial.print(" Trend_g="); Serial.print(g, 3);
+          Serial.print(" RMS_g="); Serial.print(vib_rms_g, 3);
+          Serial.print(" PP_g="); Serial.println(vib_pp_g, 3);
+        #endif
+      }
+
+      // ---- Vibration window (200 samples => 100 ms => 10 Hz metrics) ----
+      vibAcc += (long long)net;
+      vibAccSq += (long long)net * (long long)net;
+      if (net < vibMin) vibMin = net;
+      if (net > vibMax) vibMax = net;
+      vibCount++;
+
+      if (vibCount >= VIB_WINDOW_N) {
+        // mean over window
+        double mean = (double)vibAcc / (double)VIB_WINDOW_N;
+        // variance = E[x^2] - mean^2
+        double ex2 = (double)vibAccSq / (double)VIB_WINDOW_N;
+        double var = ex2 - mean*mean;
+        if (var < 0) var = 0; // numeric guard
+        double rms_ac = sqrt(var);
+
+        float rms_g = (float)rms_ac * CALIBRATION_FACTOR;
+        float pp_g  = (float)( (double)(vibMax - vibMin) ) * CALIBRATION_FACTOR;
+
+        // CALIBRATION_FACTOR may be negative depending on wiring; make metrics positive
+        vib_rms_g = fabsf(rms_g);
+        vib_pp_g  = fabsf(pp_g);
+
+        // reset window
+        vibAcc = 0;
+        vibAccSq = 0;
+        vibMin = INT32_MAX;
+        vibMax = INT32_MIN;
+        vibCount = 0;
+      }
+    }
+  }
+
+  // OLED update @10 Hz
+  oledUpdate(recording, millis());
+
+  // STOP button
+  if (recording && digitalRead(STOP_BUTTON_PIN) == LOW) {
+    Serial.println(F("STOP pressed. Closing file."));
+    if (dataFile) { dataFile.flush(); dataFile.close(); }
+    recording = false;
+    stopSignal();
+  }
+
+  // Commands
+  if (Serial.available()){
+    String cmd = Serial.readStringUntil('\n'); cmd.trim();
+    if (cmd == "t") doTare(400);
+  }
+}
